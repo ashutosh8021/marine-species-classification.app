@@ -35,6 +35,9 @@ def load_model():
     model.load_state_dict(torch.load(model_path, map_location=torch.device('cpu')))
     model.eval()
     return model
+model.load_state_dict(torch.load("resnet18_half_precision.pth", map_location='cpu'))
+model = model.half()  # enable half-precision for inference
+
 
 # --- Image preprocessing ---
 def preprocess_image(image):
