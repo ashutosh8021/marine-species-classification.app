@@ -24,8 +24,7 @@ class MarineModel(torch.nn.Module):
         super(MarineModel, self).__init__()
         self.resnet = torch.hub.load('pytorch/vision', 'resnet18', pretrained=False)
         self.resnet.fc = torch.nn.Linear(self.resnet.fc.in_features, 5)  # Adjust class count
-model.load_state_dict(torch.load("resnet18_half_precision.pth", map_location='cpu'))
-model = model.half()  # enable half-precision for inference
+
 
     def forward(self, x):
         return self.resnet(x)
