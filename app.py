@@ -1,74 +1,105 @@
 import streamlit as st
 import torch
-import torchvision.transforms as transforms
+import torch.nn as nn
+from torchvision import models, transforms
 from PIL import Image
-import requests
-import os
+import numpy as np
+import matplotlib.pyplot as plt
+import cv2
 
-# --- Model download from Google Drive ---
+# --- Page title ---
+st.title("Marine Species Classifier")
+st.markdown("Upload an image to classify the marine species and view Grad-CAM heatmap.")
+
+# --- Define class labels ---
+classes = ['Species A', 'Species B', 'Species C', 'Species D', 'Species E']  # update as needed
+
+# --- Load model ---
 @st.cache_resource
-def download_model():
-    model_url = "https://drive.google.com/uc?id=1z3SQDnM3qDtQu-5f2dKLwHZfGmjCiEnc"
-    model_path = "model.pth"
-
-    if not os.path.exists(model_path):
-        with st.spinner("Downloading model..."):
-            response = requests.get(model_url)
-            with open(model_path, "wb") as f:
-                f.write(response.content)
-    return model_path
-
-# --- Define your model class here ---
-class MarineModel(torch.nn.Module):
-    def __init__(self):
-        super(MarineModel, self).__init__()
-        self.resnet = torch.hub.load('pytorch/vision', 'resnet18', pretrained=False)
-        self.resnet.fc = torch.nn.Linear(self.resnet.fc.in_features, 5)  # Adjust class count
-
-
-    def forward(self, x):
-        return self.resnet(x)
-
-# --- Load the model ---
 def load_model():
-    model_path = download_model()
-    model = MarineModel()
-    model.load_state_dict(torch.load(model_path, map_location=torch.device('cpu')))
+    model = models.resnet18(pretrained=False)
+    model.fc = nn.Linear(model.fc.in_features, len(classes))
+    state_dict = torch.load("resnet18_half_precision.pth", map_location=torch.device('cpu'))
+    model.load_state_dict(state_dict)
+    model = model.half()
     model.eval()
     return model
 
+model = load_model()
 
-
-# --- Image preprocessing ---
-def preprocess_image(image):
+# --- Define transform ---
+def transform_image(img):
     transform = transforms.Compose([
         transforms.Resize((224, 224)),
-        transforms.ToTensor()
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                             std=[0.229, 0.224, 0.225])
     ])
-    return transform(image).unsqueeze(0)
+    return transform(img).unsqueeze(0).half()
 
-# --- Main app ---
-def main():
-    st.title("🐠 Marine Species Classifier")
-    st.write("Upload an image of a marine species, and the model will classify it.")
+# --- Grad-CAM helper ---
+def generate_gradcam(model, input_tensor, class_idx):
+    activations = {}
+    gradients = {}
 
-    uploaded_file = st.file_uploader("Choose an image...", type=["jpg", "png", "jpeg"])
+    def forward_hook(module, input, output):
+        activations['value'] = output
 
-    if uploaded_file is not None:
-        image = Image.open(uploaded_file).convert('RGB')
-        st.image(image, caption='Uploaded Image', use_column_width=True)
+    def backward_hook(module, grad_input, grad_output):
+        gradients['value'] = grad_output[0]
 
-        with st.spinner("Classifying..."):
-            model = load_model()
-            input_tensor = preprocess_image(image)
+    h1 = model.layer4[1].conv2.register_forward_hook(forward_hook)
+    h2 = model.layer4[1].conv2.register_backward_hook(backward_hook)
+
+    model.zero_grad()
+    output = model(input_tensor)
+    output[0, class_idx].backward()
+
+    acts = activations['value'].detach().cpu()[0]
+    grads = gradients['value'].detach().cpu()[0]
+    weights = grads.mean(dim=(1, 2), keepdim=True)
+    cam = (weights * acts).sum(0)
+    cam = torch.relu(cam)
+    cam = cam - cam.min()
+    cam = cam / cam.max()
+    cam = cam.numpy()
+    cam = cv2.resize(cam, (224, 224))
+    cam = np.uint8(255 * cam)
+    cam = cv2.applyColorMap(cam, cv2.COLORMAP_JET)
+
+    h1.remove()
+    h2.remove()
+    return cam
+
+# --- Streamlit Tabs ---
+tab1, tab2 = st.tabs(["🔍 Prediction", "🔥 Grad-CAM Visualization"])
+
+with tab1:
+    uploaded_file = st.file_uploader("Upload an image", type=["jpg", "jpeg", "png"])
+
+    if uploaded_file:
+        image = Image.open(uploaded_file).convert("RGB")
+        st.image(image, caption="Uploaded Image", use_column_width=True)
+        input_tensor = transform_image(image)
+
+        with torch.no_grad():
             output = model(input_tensor)
-            _, predicted = torch.max(output, 1)
+            probs = torch.nn.functional.softmax(output[0], dim=0)
+            pred_idx = torch.argmax(probs).item()
 
-            # Map class index to names (update this according to your actual classes)
-            class_names = ["Shark", "Tuna", "Dolphin", "Whale", "Clownfish"]
-            prediction = class_names[predicted.item()]
+        st.markdown(f"### Predicted: **{classes[pred_idx]}**")
+        st.markdown("### Probabilities:")
+        for i, p in enumerate(probs):
+            st.write(f"{classes[i]}: {p:.4f}")
 
-        st.success(f"Predicted Species: **{prediction}**")
+with tab2:
+    if uploaded_file:
+        st.image(image, caption="Original Image", use_column_width=False)
+        st.write("Generating Grad-CAM heatmap...")
 
-if __name__ == "__main__":
-    main()
+        cam = generate_gradcam(model, input_tensor, pred_idx)
+        original = np.array(image.resize((224, 224)))
+        overlay = cv2.addWeighted(original, 0.5, cam, 0.5, 0)
+
+        st.image(overlay, caption="Grad-CAM Heatmap", use_column_width=True)
+
